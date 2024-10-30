@@ -16,3 +16,10 @@ class Descriptors(Enum):
     FREAK = auto()
     AKAZE = auto()
     TOPO_BASED = auto()
+
+
+class Keypoints(Enum):
+    VESSELS_CROSSING = auto()
+    SIFT = auto()
+    SURF = auto()
+    ORB = auto()

@@ -6,12 +6,14 @@ from scipy.ndimage import distance_transform_edt
 from skimage import transform
 from skimage.feature import match_descriptors
 from skimage.measure import ransac
-from skimage.morphology import isotropic_dilation, isotropic_erosion, skeletonize
+from skimage.morphology import isotropic_erosion
 from skimage.registration import optical_flow_ilk
 
+from fundus_stitching_toolkit.io import save_img
+from fundus_stitching_toolkit.registration.detector import _KeypointsDetector
 from fundus_stitching_toolkit.registration.helper import choose_reference_image
 from fundus_stitching_toolkit.segment import segment_od_mask, segment_vessels
-from fundus_stitching_toolkit.utils.config import Descriptors, ReferenceChoice
+from fundus_stitching_toolkit.utils.config import Descriptors, Keypoints, ReferenceChoice
 from fundus_stitching_toolkit.utils.visu import imshow
 
 
@@ -21,8 +23,11 @@ class FundusRegistration:
         images,
         reference_choice: ReferenceChoice,
         descriptor_type: Descriptors = Descriptors.TOPO_BASED,
+        keypoints_type: Keypoints = Keypoints.VESSELS_CROSSING,
         transform=transform.SimilarityTransform,
         max_ratio: float = 0.8,
+        max_dimensions=None,
+        alpha_stitch: float = 1,
     ):
         images_rois = [fundus_precise_autocrop(image=image) for image in images]
 
@@ -31,11 +36,15 @@ class FundusRegistration:
         self.masks_od, self.masks_macula = segment_od_mask(self.images)
         self.masks_vessels = segment_vessels(self.images)
 
+        self._referenceChoice = reference_choice
         self.reference_index = choose_reference_image(
             self.masks_od, self.masks_macula, self.masks_vessels, reference_choice
         )
         self.max_ratio = max_ratio
+
         self.descriptor_type = descriptor_type
+        self.keypoints_type = keypoints_type
+
         self.transform = transform
         self.keypoints = None
         self.descriptors = None
@@ -44,12 +53,14 @@ class FundusRegistration:
         self.warped_images = {}
         self.trfm_list = []
         self._ignore_index = []
-
-    def OD_centers(self):
-        return [np.mean(np.argwhere(mask), axis=0) for mask in self.masks_od]
+        if max_dimensions is None:
+            max_dimensions = [_ * 3 for _ in self.images[0].shape[:2]]
+        self.max_dimensions = max_dimensions
+        self.alpha_stitch = alpha_stitch
+        self.detector = _KeypointsDetector(self)
 
     def register(self):
-        self.extract_keypoints_from_vessels()
+        self.extract_keypoints()
         self.compute_descriptors()
         self.match_all_descriptors()
         self.registration()
@@ -58,52 +69,11 @@ class FundusRegistration:
         # self.elastic_registration()
         return self.stitch()
 
-    def extract_keypoints_from_vessels(self, neighborhood_size=3):
-        """
-        Compute the skeleton of the vessels masks and extract keypoints, which are defined as the bifurcation points.
-        """
-
-        vessels_skeletons = [
-            skeletonize(mask).astype(np.uint8) for mask, odmask in zip(self.masks_vessels, self.masks_od)
-        ]
-
-        self.keypoints = []
-        kernel = np.ones((neighborhood_size, neighborhood_size), np.uint8)
-        for skeleton in vessels_skeletons:
-            # Compute the distance transform
-
-            neighbors = cv2.filter2D(skeleton, -1, kernel)
-            local_maxima = (skeleton > 0) & (neighbors > 3)
-
-            self.keypoints.append(np.argwhere(local_maxima))
+    def extract_keypoints(self):
+        self.detector.extract_keypoints()
 
     def compute_descriptors(self):
-        match self.descriptor_type:
-            case Descriptors.ORB:
-                self.compute_ORB_descriptors()
-
-            case Descriptors.TOPO_BASED:
-                self.compute_topological_descriptors()
-
-            case _:
-                raise ValueError("Invalid descriptor type")
-
-    def compute_ORB_descriptors(self):
-        assert self.keypoints is not None, "You need to extract keypoints first"
-
-        orb = cv2.ORB_create()
-        self.descriptors = {}
-        for i, (img, keypoints) in enumerate(zip(self.images, self.keypoints)):
-            kp = [cv2.KeyPoint(x=point[1], y=point[0], size=20) for point in keypoints.astype(np.float32)]
-            _, des = orb.compute(img, kp)
-            self.descriptors[i] = des
-
-    def compute_topological_descriptors(self):
-        self.descriptors = {}
-        od_centers = self.OD_centers()
-        for i, keypoints in enumerate(self.keypoints):
-            od_center = od_centers[i]
-            self.descriptors[i] = keypoints - od_center
+        self.detector.compute_descriptors()
 
     def match_all_descriptors(self):
         self.matched_keypoints = {}
@@ -111,7 +81,7 @@ class FundusRegistration:
         for i, descriptor in self.descriptors.items():
             self.matched_keypoints[i] = match_descriptors(ref_descriptors, descriptor, max_ratio=self.max_ratio)
 
-    def stitch(self, alpha=1):
+    def stitch(self):
         """
         Stitch the warped images using alpha blending
         """
@@ -128,7 +98,7 @@ class FundusRegistration:
         def sigmoid(x, alpha=1):
             return 1 / (1 + np.exp(-alpha * x))
 
-        distances = sigmoid(distances, alpha=alpha)
+        distances = sigmoid(distances, alpha=self.alpha_stitch)
 
         # Probas of the rois
         # For each image, where the ROIs of the other images is 0, the proba is necessarily 1
@@ -151,21 +121,21 @@ class FundusRegistration:
     def registration(self):
         self.trfm_list = {}
         self.warped_images = {}
+        self.warped_rois = {}
         ref_keypoints = self.keypoints[self.reference_index]
+        minx, miny = np.inf, np.inf
+        maxx, maxy = -np.inf, -np.inf
 
-        minx, miny = 0, 0
-        maxx, maxy = self.images[self.reference_index].shape[1], self.images[self.reference_index].shape[0]
-        h, w, c = self.images[self.reference_index].shape
+        # First pass: calculate all transformations and find global bounds
         for i, img in enumerate(self.images):
             # Get matched keypoints
             dst = ref_keypoints[self.matched_keypoints[i][:, 0]]
             src = self.keypoints[i][self.matched_keypoints[i][:, 1]]
 
             # Convert keypoints from (y, x) to (x, y)
-            src_xy = src[:, ::-1]  # Flip the columns
-            dst_xy = dst[:, ::-1]  # Flip the columns
+            src_xy = src[:, ::-1]
+            dst_xy = dst[:, ::-1]
 
-            # Estimate transform with (x, y) coordinates
             transform_model, inliers = ransac(
                 (dst_xy, src_xy),
                 self.transform,
@@ -174,51 +144,61 @@ class FundusRegistration:
                 max_trials=1000,
             )
 
-            # Store transform
+            if self.transform == transform.PolynomialTransform:
+                inverse_model, inliers = ransac(
+                    (src_xy, dst_xy),
+                    self.transform,
+                    min_samples=min(3, src_xy.shape[0]),
+                    residual_threshold=10,
+                    max_trials=1000,
+                )
+            else:
+                inverse_model = transform_model.inverse
+
             if transform_model is None:
                 continue
+
             self.trfm_list[i] = transform_model
 
             # Calculate transformed corners
-            y, x = img.shape[:2]
-            corners = np.array([[0, 0], [0, y], [x, 0], [x, y]])
-            transformed_corners = transform_model(corners)
-            # Update min and max coordinates
+            h, w = img.shape[:2]
+            corners = np.array([[0, 0], [0, w], [h, 0], [h, w]])
+            transformed_corners = inverse_model(corners)
             minx = min(minx, transformed_corners[:, 0].min())
             miny = min(miny, transformed_corners[:, 1].min())
             maxx = max(maxx, transformed_corners[:, 0].max())
             maxy = max(maxy, transformed_corners[:, 1].max())
 
-        # Calculate global transformation to shift all images to positive coordinate space
-        glob_trns = np.eye(3)
-        glob_trns[:2, 2] = -minx, -miny
-        out_shape = (int(np.abs(maxy) + np.abs(miny)), int(np.abs(maxy) + np.abs(minx)))  # TODO: Fix this
-        global_transform = self.transform(matrix=glob_trns)
-
-        # Apply global transformation and warp images
+        width = int(-minx + maxx)
+        height = int(-miny + maxy)
+        height = min(height, self.max_dimensions[0])
+        width = min(width, self.max_dimensions[1])
+        output_shape = (height, width)
+        global_transform = transform.SimilarityTransform(translation=[-minx, -miny])
+        # Second pass: apply transformations
         for i, img in enumerate(self.images):
             if i not in self.trfm_list:
                 continue
-            full_transform = self.trfm_list[i]
+            if self.transform == transform.PolynomialTransform:
+                # We can't know the global transform for now
+                t = self.trfm_list[i]
+            else:
+                t = global_transform.inverse + self.trfm_list[i]
+            # Warp image
             img = img / 255.0
-            img = transform.warp(
-                img,
-                (global_transform.inverse + full_transform),
-                output_shape=out_shape,
-                mode="constant",
-                cval=0,
-            )
-            self.warped_rois[i] = transform.warp(
-                self.rois[i],
-                (global_transform.inverse + full_transform),
-                output_shape=out_shape,
-                mode="constant",
-                cval=0,
-            )
-            # img = transform.warp(img, global_transform.inverse, mode="constant", cval=0)
+            img = transform.warp(img, t, output_shape=output_shape, mode="constant", cval=0)
 
             self.warped_images[i] = img
-            img = transform.warp(img, global_transform, mode="constant", cval=0)
+            roi = self.rois[i]
+            roi = transform.warp(
+                roi,
+                t,
+                output_shape=output_shape,
+                mode="constant",
+                cval=0,
+            )
+
+            self.warped_rois[i] = roi
 
     def elastic_registration(self):
         ref_img = self.warped_images[self.reference_index]
@@ -290,8 +270,7 @@ class FundusRegistration:
         if not isinstance(index, list):
             index = [index]
 
-        for i in index:
-            img = self.warped_images[i]
+        for i, img in self.warped_images.items():
             fig = imshow(
                 img,
                 show=False,
@@ -372,6 +351,21 @@ class FundusRegistration:
                 )
             fig.show(config={"scrollZoom": True, "displaylogo": False})
 
-    def plot_result(self, debug=False):
-        result = self.register(debug=debug)
+    def plot_result(self):
+        result = self.register()
         imshow(result, title="Result")
+
+    def save_result(self, path, with_metadata=False):
+        result = self.register()
+        result = (result * 255).astype(np.uint8)
+        if with_metadata:
+            metadata = [
+                self._referenceChoice.name,
+                self.descriptor_type.name,
+                self.keypoints_type.name,
+                f"alpha_{self.alpha_stitch}",
+            ]
+            metadata = "_".join(metadata)
+            save_img(result, path, suffix=f"_{metadata}")
+        else:
+            save_img(result, path)
