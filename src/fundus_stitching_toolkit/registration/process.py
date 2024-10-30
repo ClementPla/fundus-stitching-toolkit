@@ -13,7 +13,11 @@ from fundus_stitching_toolkit.io import save_img
 from fundus_stitching_toolkit.registration.detector import _KeypointsDetector
 from fundus_stitching_toolkit.registration.helper import choose_reference_image
 from fundus_stitching_toolkit.segment import segment_od_mask, segment_vessels
-from fundus_stitching_toolkit.utils.config import Descriptors, Keypoints, ReferenceChoice
+from fundus_stitching_toolkit.utils.config import (
+    Descriptors,
+    Keypoints,
+    ReferenceChoice,
+)
 from fundus_stitching_toolkit.utils.visu import imshow
 
 
@@ -79,7 +83,9 @@ class FundusRegistration:
         self.matched_keypoints = {}
         ref_descriptors = self.descriptors[self.reference_index]
         for i, descriptor in self.descriptors.items():
-            self.matched_keypoints[i] = match_descriptors(ref_descriptors, descriptor, max_ratio=self.max_ratio)
+            self.matched_keypoints[i] = match_descriptors(
+                ref_descriptors, descriptor, max_ratio=self.max_ratio
+            )
 
     def stitch(self):
         """
@@ -87,30 +93,35 @@ class FundusRegistration:
         """
 
         # Determine the output shape from the warped images
-        rois = np.asarray([roi for roi in self.warped_rois.values()]).astype(bool)
-        eroded_rois = np.asarray([isotropic_erosion(roi, 16) for roi in rois]).astype(bool)
+        rois = np.asarray(
+            [roi for roi in self.warped_rois.values() if np.sum(roi) > 1e3]
+        ).astype(bool)
+        eroded_rois = np.asarray([isotropic_erosion(roi, 25) for roi in rois]).astype(
+            bool
+        )
         rois = eroded_rois
         distances = np.asarray([distance_transform_edt(roi) for roi in rois])
         distances -= distances.min((1, 2), keepdims=True)
         distances /= distances.max((1, 2), keepdims=True)  # Distance between 0 and 1
         distances = distances * 2 - 1  # Distance between -1 and 1
 
-        def sigmoid(x, alpha=1):
-            return 1 / (1 + np.exp(-alpha * x))
+        # distances = sigmoid(distances, alpha=self.alpha_stitch)
+        distances = np.exp(self.alpha_stitch * distances)
+        distances = distances / distances.sum(0)
 
-        distances = sigmoid(distances, alpha=self.alpha_stitch)
+        result = np.asarray(
+            [
+                img
+                for i, img in self.warped_images.items()
+                if np.sum(self.warped_rois[i]) > 1e3
+            ]
+        )
+        distances[~rois] = np.nan
 
-        # Probas of the rois
-        # For each image, where the ROIs of the other images is 0, the proba is necessarily 1
-        softmax_distances = np.clip(distances, 0, 1)
-        softmax_distances[~rois] = np.nan
-
-        result = np.asarray(list(self.warped_images.values()))
-
-        result = softmax_distances[:, :, :, None] * result
-        result = np.nanmean(result, 0) / np.nanmean(softmax_distances, 0)[:, :, None]
-
-        # result[np.isnan(result)] = 0
+        result = distances[:, :, :, None] * result
+        eps = 1e-8
+        result = np.nansum(result, 0) / (np.nansum(distances, 0)[:, :, None] + eps)
+        result[np.isnan(result)] = 0
         # result -= np.nanmin(result)
         # result /= np.nanmax(result)
 
@@ -139,24 +150,23 @@ class FundusRegistration:
             transform_model, inliers = ransac(
                 (dst_xy, src_xy),
                 self.transform,
-                min_samples=min(3, src_xy.shape[0]),
-                residual_threshold=10,
+                min_samples=min(7, src_xy.shape[0]),
+                residual_threshold=5,
                 max_trials=1000,
             )
+            if transform_model is None:
+                continue
 
             if self.transform == transform.PolynomialTransform:
                 inverse_model, inliers = ransac(
                     (src_xy, dst_xy),
                     self.transform,
-                    min_samples=min(3, src_xy.shape[0]),
-                    residual_threshold=10,
+                    min_samples=min(7, src_xy.shape[0]),
+                    residual_threshold=5,
                     max_trials=1000,
                 )
             else:
                 inverse_model = transform_model.inverse
-
-            if transform_model is None:
-                continue
 
             self.trfm_list[i] = transform_model
 
@@ -186,7 +196,9 @@ class FundusRegistration:
                 t = global_transform.inverse + self.trfm_list[i]
             # Warp image
             img = img / 255.0
-            img = transform.warp(img, t, output_shape=output_shape, mode="constant", cval=0)
+            img = transform.warp(
+                img, t, output_shape=output_shape, mode="constant", cval=0
+            )
 
             self.warped_images[i] = img
             roi = self.rois[i]
@@ -205,7 +217,9 @@ class FundusRegistration:
 
         nr, nc, _ = ref_img.shape
 
-        row_coords, col_coords = np.meshgrid(np.arange(nr), np.arange(nc), indexing="ij")
+        row_coords, col_coords = np.meshgrid(
+            np.arange(nr), np.arange(nc), indexing="ij"
+        )
 
         for i, img in enumerate(self.images):
             print(f"Computing optical flow for image {i}")
@@ -215,7 +229,9 @@ class FundusRegistration:
 
             for j in range(3):
                 self.warped_images[i][:, :, j] = transform.warp(
-                    self.warped_images[i][:, :, j], np.array([row_coords + v, col_coords + u]), mode="edge"
+                    self.warped_images[i][:, :, j],
+                    np.array([row_coords + v, col_coords + u]),
+                    mode="edge",
                 )
 
     def plot(self, index=None, with_masks=True, with_keypoints=True):
@@ -317,7 +333,9 @@ class FundusRegistration:
             sideBysideImg = np.concatenate(([ref_img, img]), axis=1)
             sideBysideMaskOD = np.concatenate(([ref_od, mask_od]), axis=1)
             sideBysideMaskMac = np.concatenate(([ref_mac, mask_mac]), axis=1)
-            sideBysideMaskVessels = np.concatenate(([ref_vessels, mask_vessels]), axis=1)
+            sideBysideMaskVessels = np.concatenate(
+                ([ref_vessels, mask_vessels]), axis=1
+            )
 
             keypoints = self.keypoints[i].copy()
 
@@ -330,7 +348,11 @@ class FundusRegistration:
                     sideBysideMaskVessels,
                 ],
                 keypoints=np.concatenate(
-                    [keypoints_ref[self.matched_keypoints[i][:, 0]], keypoints[self.matched_keypoints[i][:, 1]]], 0
+                    [
+                        keypoints_ref[self.matched_keypoints[i][:, 0]],
+                        keypoints[self.matched_keypoints[i][:, 1]],
+                    ],
+                    0,
                 ),
                 title="Correspondances",
                 show=False,
