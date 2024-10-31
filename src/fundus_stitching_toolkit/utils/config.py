@@ -16,6 +16,8 @@ class Descriptors(Enum):
     FREAK = auto()
     AKAZE = auto()
     TOPO_BASED = auto()
+    DINOV2 = auto()
+    CNN = auto()
 
 
 class Keypoints(Enum):
@@ -23,3 +25,4 @@ class Keypoints(Enum):
     SIFT = auto()
     SURF = auto()
     ORB = auto()
+    MODEL_KLARGEST = auto()

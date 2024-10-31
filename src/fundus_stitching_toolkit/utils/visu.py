@@ -19,12 +19,16 @@ def draw_masks(img, masks, opacity=0.3, border_opacity=0.7, border_size=3):
 
     for i, mask in enumerate(masks):
         masked_image = np.where(
-            np.repeat(mask[:, :, np.newaxis], 3, axis=2), np.asarray(colors[i], dtype="uint8"), masked_image
+            np.repeat(mask[:, :, np.newaxis], 3, axis=2),
+            np.asarray(colors[i], dtype="uint8"),
+            masked_image,
         )
         gradient = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_GRADIENT, kernel)
 
         masked_gradient = np.where(
-            np.repeat(gradient[:, :, np.newaxis], 3, axis=2), np.asarray(colors[i], dtype="uint8"), masked_gradient
+            np.repeat(gradient[:, :, np.newaxis], 3, axis=2),
+            np.asarray(colors[i], dtype="uint8"),
+            masked_gradient,
         )
 
     masked_image = masked_image.astype(np.uint8)
@@ -58,15 +62,24 @@ def imshow(
         plotly.graph_objs.Figure: Plotly figure.
     """
     np.random.seed(1)
-    if image.dtype == np.float32:
+    if image.dtype.kind == "f":
+        # image -= image.min()
+        # image /= image.max()
         image = (image * 255).astype(np.uint8)
 
     if mask is not None:
-        image = draw_masks(image, mask, opacity=opacity, border_opacity=border_opacity, border_size=border_size)
+        image = draw_masks(
+            image,
+            mask,
+            opacity=opacity,
+            border_opacity=border_opacity,
+            border_size=border_size,
+        )
 
     fig = px.imshow(
-        image,
+        image + 1e-7,
         title=title,
+        zmax=255,
         x=np.arange(image.shape[1]),
         y=np.arange(image.shape[0]),
     )
@@ -74,7 +87,11 @@ def imshow(
     if keypoints is not None:
         fig.add_trace(
             go.Scatter(
-                x=keypoints[:, 1], y=keypoints[:, 0], mode="markers", marker=dict(size=4, opacity=0.8), showlegend=False
+                x=keypoints[:, 1],
+                y=keypoints[:, 0],
+                mode="markers",
+                marker=dict(size=8, opacity=0.8, color="green"),
+                showlegend=False,
             )
         )
 
